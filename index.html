@@ -12,6 +12,10 @@
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="icon" href="icon-180.png">
 <link rel="manifest" href="manifest.json">
+<script src="firebase-config.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=DM+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap">
 <style>
 /* Layout: one 480px column, big amount + keypad on top, bottom tab bar (Log / History / Insights / Budget). */
@@ -391,8 +395,8 @@ label.btn { display: inline-block; cursor: pointer; }
     };
   }
   function makeDbStore(db, uid) {
-    var col = db.doc('data/users/' + uid + '/profile').collection('entries');
-    var settings = db.doc('data/users/' + uid + '/settings');
+    var col = db.doc('users/' + uid).collection('entries');
+    var settings = db.doc('users/' + uid + '/meta/settings');
     var chain = Promise.resolve(), inFlight = 0;
     function chunked(items, fn, progress) {
       var i = 0;
@@ -427,12 +431,52 @@ label.btn { display: inline-block; cursor: pointer; }
       removeMany: function (ids, progress) { return chunked(ids, function (id) { return col.doc(id).delete(); }, progress); }
     };
   }
-  async function init() {
-    store = makeLocalStore();
-    S.mode = store.mode; S.ready = true;
-    renderAll();
-    handleQuickAdd();
+  function cloudConfigured() { var c = window.FIREBASE_CONFIG; return !!(c && c.apiKey && c.projectId && String(c.apiKey).indexOf('PASTE') < 0); }
+  function setNavVisible(v) { var n = document.querySelector('.tabs'); if (n) n.style.display = v ? '' : 'none'; }
+  function renderAuth(msg, mode) {
+    S.tab = 'auth'; S.ready = false; store = null; setNavVisible(false);
+    var create = mode === 'create';
+    $('#when').textContent = '';
+    $('#view').innerHTML = '<section class="card" style="padding:18px"><h2 style="margin:0 0 6px">' + (create ? 'Create your account' : 'Sign in') + '</h2>' +
+      '<p class="note" style="margin:0 0 14px">Your expenses sync privately across your devices. Use the same email on each one.</p>' +
+      '<form id="authform" data-mode="' + (create ? 'create' : 'in') + '" style="display:grid;gap:10px">' +
+      '<input class="field" id="auth-email" type="email" autocomplete="email" placeholder="Email" required>' +
+      '<input class="field" id="auth-pass" type="password" autocomplete="' + (create ? 'new-password' : 'current-password') + '" placeholder="Password (6+ characters)" minlength="6" required>' +
+      '<button class="btn primary" type="submit" style="padding:13px">' + (create ? 'Create account' : 'Sign in') + '</button></form>' +
+      '<p class="note" id="auth-msg" role="alert" style="color:var(--danger,#b3261e)">' + esc(msg || '') + '</p>' +
+      '<button class="btn" type="button" data-act="authswitch" data-mode="' + (create ? 'in' : 'create') + '">' + (create ? 'I already have an account' : 'Create an account') + '</button></section>';
   }
+  function authMessage(e) {
+    var c = e && e.code || '';
+    if (c === 'auth/invalid-credential' || c === 'auth/wrong-password' || c === 'auth/user-not-found' || c === 'auth/invalid-login-credentials') return 'Wrong email or password.';
+    if (c === 'auth/email-already-in-use') return 'That email already has an account. Use Sign in.';
+    if (c === 'auth/weak-password') return 'Password needs at least 6 characters.';
+    if (c === 'auth/invalid-email') return 'That email address does not look right.';
+    if (c === 'auth/network-request-failed') return 'No connection. Try again when you are online.';
+    if (c === 'auth/operation-not-allowed') return 'Email sign-in is not turned on in Firebase yet.';
+    return 'Could not sign in. Please try again.';
+  }
+  function init() {
+    if (!cloudConfigured()) { store = makeLocalStore(); S.mode = store.mode; S.ready = true; renderAll(); handleQuickAdd(); return; }
+    if (!window.firebase) { renderAuth('Could not load the sign-in service. Check your connection and reload.'); return; }
+    var fb = window.firebase;
+    if (!fb.apps.length) fb.initializeApp(window.FIREBASE_CONFIG);
+    var db = fb.firestore();
+    try { db.enablePersistence({ synchronizeTabs: true }).catch(function () {}); } catch (e) { /* ignore */ }
+    fb.auth().onAuthStateChanged(function (user) {
+      if (!user) { renderAuth('', 'in'); return; }
+      store = makeDbStore(db, user.uid);
+      S.mode = 'db'; S.ready = true; S.tab = 'log'; setNavVisible(true);
+      renderAll(); handleQuickAdd();
+    });
+  }
+  function doAuth(form) {
+    var email = $('#auth-email').value.trim(), pass = $('#auth-pass').value, create = form.dataset.mode === 'create';
+    var btn = form.querySelector('button'); btn.disabled = true;
+    var p = create ? window.firebase.auth().createUserWithEmailAndPassword(email, pass) : window.firebase.auth().signInWithEmailAndPassword(email, pass);
+    p.catch(function (e) { btn.disabled = false; var m = $('#auth-msg'); if (m) m.textContent = authMessage(e); });
+  }
+  function signOut() { try { window.firebase.auth().signOut(); } catch (e) { /* ignore */ } }
 
   /* ---------- Actions ---------- */
   function toast(msg, undo) {
@@ -775,9 +819,9 @@ label.btn { display: inline-block; cursor: pointer; }
           '<input class="field num cb" id="cb-' + c.id + '" data-id="' + c.id + '" inputmode="decimal" autocomplete="off" placeholder="None" value="' + fmtIn(S.catBudgets[c.id] || 0) + '" aria-label="' + esc(c.name) + ' monthly budget"></div>';
       }).join('') + '</div><div class="alloc" id="alloc" aria-live="polite"></div>' +
       '<button class="btn primary" type="submit" style="width:100%;padding:13px">Save budgets</button></form>' +
-      '<p class="note">' + (S.mode === 'db' ? 'Your expenses and budgets are saved privately to your account.' : 'Your expenses are saved in this browser only. Sign in to Claude to keep them across devices.') + '</p>';
+      '<p class="note">' + (S.mode === 'db' ? 'Your expenses and budgets sync privately to your account.' : 'Your expenses are saved in this browser only.') + '</p>' + (S.mode === 'db' ? '<button class="btn" type="button" data-act="signout">Sign out</button>' : '');
     html += '<details class="help"><summary>Add from iPhone Back Tap</summary><p>A Shortcut can open this app\u2019s link with the entry in the address, and the app saves it:</p>' +
-      '<p class="num">YOUR-APP-LINK#add~YYYYMMDDHHMMSS~amount~category~note</p>' +
+      '<p class="num">'+esc(location.origin + location.pathname)+'#add~YYYYMMDDHHMMSS~amount~category~note</p>' +
       '<p>Use underscores for spaces in the category and note. Categories that do not exist yet are created.</p></details>';
     if (hasSamples()) html += '<div class="section-head"><h2>Sample data</h2></div><div class="empty-box"><p>Example entries are mixed into your history. Remove them before you start tracking for real.</p><button class="btn" type="button" data-act="clearsample"' + (S.busy ? ' disabled' : '') + '>' + (S.busy ? 'Removing…' : 'Remove sample data') + '</button></div>';
     $('#view').innerHTML = html + '</section>';
@@ -1096,6 +1140,8 @@ label.btn { display: inline-block; cursor: pointer; }
     else if (a === 'sample') loadSample();
     else if (a === 'clearsample') clearSample();
     else if (a === 'export') exportCsv();
+    else if (a === 'authswitch') renderAuth('', el.dataset.mode);
+    else if (a === 'signout') signOut();
     else if (a === 'closecsv') { S.exportText = null; renderHistory(); }
     else if (a === 'copycsv') {
       var ta = $('#csvtext');
@@ -1145,6 +1191,10 @@ label.btn { display: inline-block; cursor: pointer; }
     document.querySelectorAll('.cb').forEach(function (i) { var c = parseCents(i.value); if (c > 0) cats[i.dataset.id] = c; });
     guard(store.setBudget(total, cats, fd), 'Could not save your budgets.');
     toast(total || fd.wd || fd.we || Object.keys(cats).length ? 'Budgets saved' : 'Budgets cleared');
+  });
+  document.addEventListener('submit', function (ev) {
+    if (ev.target.id !== 'authform') return;
+    ev.preventDefault(); doAuth(ev.target);
   });
   document.addEventListener('submit', function (ev) {
     if (ev.target.id !== 'addcat') return;
